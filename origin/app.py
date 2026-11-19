@@ -30,6 +30,7 @@ behavior = {
     "chunk_delay_ms": 0,
     "truncate_after_bytes": None,  # int | None
     "chunk_size": 256 * 1024,
+    "fail_status": None,  # int | None: answer package GETs with this status
 }
 hits = {"total": 0, "paths": {}}
 digests: dict[str, str] = {}
@@ -110,6 +111,13 @@ async def get_package(path: str):
     if not p.is_file():
         return PlainTextResponse("package not found", status_code=404)
 
+    # Optional forced failure (e.g. 500/503) to exercise origin-status handling.
+    forced = behavior.get("fail_status")
+    if forced:
+        return PlainTextResponse(
+            f"forced origin failure {forced}", status_code=int(forced)
+        )
+
     size = p.stat().st_size
     beh = dict(behavior)  # snapshot for this request
 
@@ -149,6 +157,12 @@ class Behavior(BaseModel):
         None, ge=0, description="abort the stream after this many bytes"
     )
     chunk_size: int = Field(256 * 1024, ge=1, description="origin stream chunk size")
+    fail_status: int | None = Field(
+        None,
+        ge=100,
+        le=599,
+        description="answer package GETs with this HTTP status instead of streaming",
+    )
 
 
 @app.post("/control/behavior")

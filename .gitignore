@@ -1,0 +1,9 @@
+# Local Python / test artifacts (not part of the deliverable)
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Runtime data when apps are launched outside Docker
+cache/
+packages/

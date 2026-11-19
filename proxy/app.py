@@ -6,13 +6,23 @@ state in this process; completed packages live on disk under CACHE_DIR.
 Design notes
 ------------
 * Single-flight: one fill task per path generation; concurrent misses attach
-  to the same fill and read the growing ``.part-<gen>`` file from offset 0.
+  to the same fill and read the growing ``.part-<fill_id>`` file from offset 0.
+* Every origin fill gets a unique ``X-Fill-ID``. The header is returned on
+  every download response participating in that fill, including error
+  responses produced before the response body starts.
+* Failed fills are classified (``origin_status`` / ``transport`` /
+  ``local_write``) and recorded in an in-process incident log; the last 50
+  failed fills are queryable at ``GET /cache/incidents``. One single-flight
+  fill records exactly one incident. Origin 404 and client disconnects are
+  not fill failures and are not recorded.
 * Slow clients never block the fill or other clients: the fill only writes to
   disk; every reader tails the file at its own pace. Per-client memory is one
   read buffer, independent of package size.
 * Purge unregisters the current generation. In-flight fills keep feeding
   their existing readers but are never re-registered; old files are unlinked
-  once the last reader detaches.
+  once the last reader detaches. Incident records are immutable and survive
+  purges; a later successful fill gets a new fill id and never overwrites an
+  old record.
 * Origin failure fails every attached download and never leaves a cached
   half-package. Startup deletes leftover ``.part-*`` files and keeps complete
   packages.
@@ -26,18 +36,26 @@ import os
 import re
 import time
 import uuid
+from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import aiohttp
 from fastapi import FastAPI
-from fastapi.responses import PlainTextResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
 ORIGIN_BASE_URL = os.environ.get("ORIGIN_BASE_URL", "http://127.0.0.1:9000").rstrip("/")
 CACHE_DIR = Path(os.environ.get("CACHE_DIR", "./cache")).resolve()
 CHUNK = 256 * 1024  # bytes per origin read / client write / disk read
+MAX_INCIDENTS = 50  # keep only the most recent failed fills, in-process only
 
 _SEGMENT_RE = re.compile(r"\A[A-Za-z0-9._~!$&'()*+,;=:@-]+\Z")
+_FILL_ID_RE = re.compile(r"\A[0-9a-f]{32}\Z")
+
+# Incident reason taxonomy.
+REASON_ORIGIN_STATUS = "origin_status"  # origin answered with a non-200 status
+REASON_TRANSPORT = "transport"          # connect / timeout / truncated transfer
+REASON_LOCAL_WRITE = "local_write"      # proxy could not write its cache volume
 
 
 def validate_key(raw: str) -> str:
@@ -64,18 +82,31 @@ class FillFailed(Exception):
     """Raised inside a client stream when the origin fill failed."""
 
 
+class _OriginStatusError(Exception):
+    """Origin answered with a non-200, non-404 HTTP status."""
+
+    def __init__(self, status: int) -> None:
+        super().__init__(f"origin responded with status {status}")
+        self.status = status
+
+
+class _LocalWriteError(Exception):
+    """Writing the cache volume (part file, rename, meta) failed."""
+
+
 class Entry:
     """One generation of a cached object.
 
     state: filling -> complete          (registered, file renamed into place)
-                 \-> closed             (purged mid-fill; fill finished, file
+                 \\-> closed             (purged mid-fill; fill finished, file
                                           kept only until readers drain)
-                 \-> failed             (origin error; part file removed)
+                 \\-> failed             (origin error; part file removed)
     """
 
     def __init__(self, key: str) -> None:
         self.key = key
-        self.gen = uuid.uuid4().hex[:12]
+        self.fill_id = uuid.uuid4().hex
+        self.gen = self.fill_id  # backward-compatible alias for part naming/info
         self.state = "filling"
         self.purged = False
         self.readers = 0
@@ -87,6 +118,8 @@ class Entry:
         self.meta: dict = {}
         self.cond = asyncio.Condition()
         self.fill_task: asyncio.Task | None = None
+        self.started_at = time.time()
+        self.incident_recorded = False  # one single-flight fill -> at most one row
 
     @property
     def final_path(self) -> Path:
@@ -94,7 +127,7 @@ class Entry:
 
     @property
     def part_path(self) -> Path:
-        return CACHE_DIR / f"{self.key}.part-{self.gen}"
+        return CACHE_DIR / f"{self.key}.part-{self.fill_id}"
 
     @property
     def meta_path(self) -> Path:
@@ -107,7 +140,8 @@ class Entry:
             "readers": self.readers,
             "written": self.written,
             "size": self.size,
-            "gen": self.gen,
+            "fill_id": self.fill_id,
+            "gen": self.fill_id,
             "error": self.error,
         }
 
@@ -117,6 +151,9 @@ class Cache:
         self.entries: dict[str, Entry] = {}
         self.lock = asyncio.Lock()
         self.session: aiohttp.ClientSession | None = None
+        # Bounded in-process incident log (oldest evicted at MAX_INCIDENTS).
+        self.incidents: deque[dict] = deque()
+        self.incident_by_id: dict[str, dict] = {}
 
     # ------------------------------------------------------------------ #
     # registry                                                            #
@@ -163,7 +200,11 @@ class Cache:
             self._maybe_reap_locked(e)
 
     async def purge(self, key: str) -> bool:
-        """Unregister the current generation; files go away with last reader."""
+        """Unregister the current generation; files go away with last reader.
+
+        Incident rows are never touched: old fills keep their old-generation
+        records and a later successful fill cannot overwrite them.
+        """
         async with self.lock:
             e = self.entries.pop(key, None)
             if e is not None:
@@ -197,75 +238,134 @@ class Cache:
             _unlink_quiet(e.meta_path)
 
     # ------------------------------------------------------------------ #
+    # incident log                                                        #
+    # ------------------------------------------------------------------ #
+
+    def _record_incident_locked(self, e: Entry, reason: str) -> None:
+        incident = {
+            "fill_id": e.fill_id,
+            "path": e.key,
+            "bytes_written": e.written,
+            "reason": reason,
+            "origin_status": e.origin_status,
+            "error": e.error,
+            "started_at": e.started_at,
+            "failed_at": time.time(),
+        }
+        if len(self.incidents) >= MAX_INCIDENTS:
+            oldest = self.incidents.popleft()
+            self.incident_by_id.pop(oldest["fill_id"], None)
+        self.incidents.append(incident)
+        self.incident_by_id[e.fill_id] = incident
+
+    # ------------------------------------------------------------------ #
     # origin fill                                                         #
     # ------------------------------------------------------------------ #
 
     async def _fill(self, e: Entry) -> None:
         assert self.session is not None
-        url = f"{ORIGIN_BASE_URL}/packages/{e.key}"
         try:
-            async with self.session.get(url) as resp:
-                e.origin_status = resp.status
-                if resp.status != 200:
-                    e.error = f"origin responded with status {resp.status}"
-                    await self._finish(e, "failed")
+            await self._do_fill(e)
+        except asyncio.CancelledError:
+            raise
+        except _OriginStatusError as exc:
+            e.origin_status = exc.status
+            e.error = str(exc)
+            await self._fail(e, REASON_ORIGIN_STATUS)
+        except _LocalWriteError as exc:
+            e.error = f"{type(exc.__cause__).__name__}: {exc.__cause__}" if exc.__cause__ else str(exc)
+            await self._fail(e, REASON_LOCAL_WRITE)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            # Connection refused/reset, timeouts, truncated payloads, etc.
+            e.error = f"{type(exc).__name__}: {exc}"
+            await self._fail(e, REASON_TRANSPORT)
+        except Exception as exc:  # noqa: BLE001 - anything else is link-side
+            e.error = f"{type(exc).__name__}: {exc}"
+            await self._fail(e, REASON_TRANSPORT)
+
+    async def _do_fill(self, e: Entry) -> None:
+        url = f"{ORIGIN_BASE_URL}/packages/{e.key}"
+        async with self.session.get(url) as resp:
+            e.origin_status = resp.status
+            if resp.status != 200:
+                if resp.status == 404:
+                    # 404 is an ordinary miss, not a fill failure: no incident,
+                    # no negative cache; the next GET retries the origin.
+                    e.error = "origin responded with status 404"
+                    await self._fail(e, reason=None)
                     return
-                cl = resp.content_length
-                e.size = cl if cl is not None else -1
-                e.meta = {
-                    "content_type": resp.headers.get("Content-Type")
-                    or "application/octet-stream",
-                    "sha256": resp.headers.get("X-Package-Sha256"),
-                    "fetched_at": time.time(),
-                }
+                raise _OriginStatusError(resp.status)
+            cl = resp.content_length
+            e.size = cl if cl is not None else -1
+            e.meta = {
+                "content_type": resp.headers.get("Content-Type")
+                or "application/octet-stream",
+                "sha256": resp.headers.get("X-Package-Sha256"),
+                "fetched_at": time.time(),
+            }
+            try:
                 e.part_path.parent.mkdir(parents=True, exist_ok=True)
                 f = open(e.part_path, "wb")
-                try:
-                    # Part file exists before readers are allowed to open it.
-                    e.headers_known = True
-                    async with e.cond:
-                        e.cond.notify_all()
-                    written = 0
-                    async for chunk in resp.content.iter_chunked(CHUNK):
+            except OSError as exc:
+                raise _LocalWriteError("cannot open part file") from exc
+            try:
+                # Part file exists before readers are allowed to open it.
+                e.headers_known = True
+                async with e.cond:
+                    e.cond.notify_all()
+                written = 0
+                async for chunk in resp.content.iter_chunked(CHUNK):
+                    try:
                         await asyncio.to_thread(f.write, chunk)
                         await asyncio.to_thread(f.flush)
-                        written += len(chunk)
-                        e.written = written
-                        async with e.cond:
-                            e.cond.notify_all()
-                finally:
+                    except OSError as exc:
+                        raise _LocalWriteError("write/flush failed") from exc
+                    written += len(chunk)
+                    e.written = written
+                    async with e.cond:
+                        e.cond.notify_all()
+            finally:
+                try:
                     await asyncio.to_thread(f.close)
-                if e.size != -1 and written != e.size:
-                    raise aiohttp.ClientPayloadError(
-                        f"short read from origin: {written}/{e.size} bytes"
-                    )
-            async with self.lock:
-                e.size = written if e.size == -1 else e.size
-                e.meta["size"] = written
-                if e.purged:
-                    # Purged mid-fill: keep the part file for current readers
-                    # only; never register this generation.
-                    e.state = "closed"
-                else:
+                except OSError as exc:
+                    raise _LocalWriteError("close failed") from exc
+            if e.size != -1 and written != e.size:
+                # Origin closed the connection before declaring Content-Length.
+                raise aiohttp.ClientPayloadError(
+                    f"short read from origin: {written}/{e.size} bytes"
+                )
+        async with self.lock:
+            e.size = written if e.size == -1 else e.size
+            e.meta["size"] = written
+            if e.purged:
+                # Purged mid-fill: keep the part file for current readers
+                # only; never register this generation.
+                e.state = "closed"
+            else:
+                try:
                     os.replace(e.part_path, e.final_path)  # atomic publish
                     try:
                         e.meta_path.write_text(json.dumps(e.meta))
                     except OSError:
                         pass
-                    e.state = "complete"
-                async with e.cond:
-                    e.cond.notify_all()
-                self._maybe_reap_locked(e)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - any origin/IO error fails the fill
-            e.error = f"{type(exc).__name__}: {exc}"
-            await self._finish(e, "failed")
+                except OSError as exc:
+                    raise _LocalWriteError("publish failed") from exc
+                e.state = "complete"
+            async with e.cond:
+                e.cond.notify_all()
+            self._maybe_reap_locked(e)
 
-    async def _finish(self, e: Entry, state: str) -> None:
+    async def _fail(self, e: Entry, reason: str | None) -> None:
+        """Mark the fill failed; record one incident unless reason is None.
+
+        reason=None is reserved for non-incident failures (origin 404).
+        """
         async with self.lock:
-            e.state = state
-            if state == "failed" and self.entries.get(e.key) is e:
+            e.state = "failed"
+            if reason is not None and not e.incident_recorded:
+                e.incident_recorded = True
+                self._record_incident_locked(e, reason)
+            if self.entries.get(e.key) is e:
                 del self.entries[e.key]  # next GET retries the origin
             async with e.cond:
                 e.cond.notify_all()
@@ -311,6 +411,9 @@ class Cache:
             try:
                 f.close()
             finally:
+                # A client going away (including its own disconnect) only
+                # detaches its reader; the fill itself is unaffected and no
+                # incident is recorded on the client's behalf.
                 await self.detach(e)
 
 
@@ -343,7 +446,7 @@ async def lifespan(app: FastAPI):
         await cache.session.close()
 
 
-app = FastAPI(title="pkg-cache-proxy", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="pkg-cache-proxy", version="1.1.0", lifespan=lifespan)
 
 
 @app.get("/healthz")
@@ -353,13 +456,19 @@ async def healthz():
 
 @app.get("/packages/{path:path}")
 async def get_package(path: str):
-    """Download a complete package by path (streamed from byte 0)."""
+    """Download a complete package by path (streamed from byte 0).
+
+    Every response tied to a fill carries the fill's ``X-Fill-ID`` header,
+    including error responses produced before the body starts. A 400 from
+    path validation has no fill and therefore carries no id.
+    """
     try:
         key = validate_key(path)
     except ValueError as exc:
         return PlainTextResponse(str(exc), status_code=400)
 
     entry = await cache.attach(key)
+    fill_headers = {"X-Fill-ID": entry.fill_id}
     hit = entry.state == "complete"
     try:
         if not entry.headers_known:
@@ -378,9 +487,13 @@ async def get_package(path: str):
             if entry.origin_status and entry.origin_status != 200
             else 502
         )
-        return PlainTextResponse(f"origin fetch failed: {entry.error}", status_code=status)
+        return PlainTextResponse(
+            f"origin fetch failed: {entry.error}",
+            status_code=status,
+            headers=fill_headers,
+        )
 
-    headers = {"X-Cache": "HIT" if hit else "MISS"}
+    headers = {"X-Cache": "HIT" if hit else "MISS", **fill_headers}
     if entry.size >= 0:
         headers["Content-Length"] = str(entry.size)
     sha256 = entry.meta.get("sha256")
@@ -396,7 +509,11 @@ async def get_package(path: str):
 @app.post("/purge/{path:path}")
 async def purge_package(path: str):
     """Purge one path. The next download re-fills from the origin; downloads
-    already in progress keep reading their old generation to completion."""
+    already in progress keep reading their old generation to completion.
+
+    Incident records are not affected: old rows keep their old fill ids and a
+    new successful fill cannot overwrite them.
+    """
     try:
         key = validate_key(path)
     except ValueError as exc:
@@ -409,3 +526,36 @@ async def purge_package(path: str):
 async def cache_status():
     async with cache.lock:
         return {k: e.info() for k, e in cache.entries.items()}
+
+
+@app.get("/cache/incidents")
+async def list_incidents(limit: int | None = None):
+    """List the most recent failed-fill incidents (newest first, max 50).
+
+    Each row gives the package path, bytes already written to the cache
+    volume before failure, and the classified reason (``origin_status``,
+    ``transport`` or ``local_write``). Records live in this process only and
+    are gone after a restart.
+    """
+    async with cache.lock:
+        items = [dict(i) for i in reversed(cache.incidents)]
+    if limit is not None:
+        items = items[: max(0, min(limit, MAX_INCIDENTS))]
+    return {
+        "count": len(items),
+        "max_retained": MAX_INCIDENTS,
+        "incidents": [dict(i) for i in items],
+    }
+
+
+@app.get("/cache/incidents/{fill_id}")
+async def get_incident(fill_id: str):
+    """Look up one failed fill by its X-Fill-ID."""
+    if not _FILL_ID_RE.match(fill_id):
+        return PlainTextResponse("unknown fill id", status_code=404)
+    async with cache.lock:
+        incident = cache.incident_by_id.get(fill_id)
+        payload = dict(incident) if incident is not None else None
+    if payload is None:
+        return PlainTextResponse("unknown fill id", status_code=404)
+    return JSONResponse(payload)
